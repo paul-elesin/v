@@ -103,8 +103,10 @@ fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 	mut return_type := ast.void_type
 	is_decl := node.op == .decl_assign
 	g.assign_op = node.op
+	g.inside_assign = true
 	defer {
 		g.assign_op = .unknown
+		g.inside_assign = false
 	}
 	op := if is_decl { token.Kind.assign } else { node.op }
 	right_expr := node.right[0]
@@ -346,37 +348,43 @@ fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 		} else if node.op == .assign && !g.pref.translated
 			&& (is_fixed_array_init || (right_sym.kind == .array_fixed && val is ast.Ident)) {
 			// Fixed arrays
-			mut v_var := ''
-			arr_typ := styp.trim('*')
-			if is_fixed_array_init {
-				right := val as ast.ArrayInit
-				v_var = g.new_tmp_var()
-				g.write('${arr_typ} ${v_var} = ')
-				g.expr(right)
-				g.writeln(';')
-			} else {
-				right := val as ast.Ident
-				v_var = right.name
-			}
-			pos := g.out.len
-			g.expr(left)
-
-			if g.is_arraymap_set && g.arraymap_set_pos > 0 {
-				g.go_back_to(g.arraymap_set_pos)
-				g.write(', &${v_var})')
-				g.is_arraymap_set = false
-				g.arraymap_set_pos = 0
-			} else {
-				g.go_back_to(pos)
-				is_var_mut := !is_decl && left.is_auto_deref_var()
-				addr_left := if is_var_mut { '' } else { '&' }
-				g.writeln('')
-				g.write('memcpy(${addr_left}')
+			if is_fixed_array_init && var_type.has_flag(.option) {
 				g.expr(left)
-				addr_val := if is_fixed_array_var { '' } else { '&' }
-				g.writeln(', ${addr_val}${v_var}, sizeof(${arr_typ}));')
+				g.write(' = ')
+				g.expr_with_opt(val, val_type, var_type)
+			} else {
+				mut v_var := ''
+				arr_typ := styp.trim('*')
+				if is_fixed_array_init {
+					right := val as ast.ArrayInit
+					v_var = g.new_tmp_var()
+					g.write('${arr_typ} ${v_var} = ')
+					g.expr(right)
+					g.writeln(';')
+				} else {
+					right := val as ast.Ident
+					v_var = right.name
+				}
+				pos := g.out.len
+				g.expr(left)
+
+				if g.is_arraymap_set && g.arraymap_set_pos > 0 {
+					g.go_back_to(g.arraymap_set_pos)
+					g.write(', &${v_var})')
+					g.is_arraymap_set = false
+					g.arraymap_set_pos = 0
+				} else {
+					g.go_back_to(pos)
+					is_var_mut := !is_decl && left.is_auto_deref_var()
+					addr_left := if is_var_mut { '' } else { '&' }
+					g.writeln('')
+					g.write('memcpy(${addr_left}')
+					g.expr(left)
+					addr_val := if is_fixed_array_var { '' } else { '&' }
+					g.writeln(', ${addr_val}${v_var}, sizeof(${arr_typ}));')
+				}
+				g.is_assign_lhs = false
 			}
-			g.is_assign_lhs = false
 		} else {
 			is_inside_ternary := g.inside_ternary != 0
 			cur_line := if is_inside_ternary && is_decl {
@@ -565,11 +573,17 @@ fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 					} else {
 						'(byte*)&'
 					}
-					g.write('memcpy(${final_typ_str}')
-					g.expr(left)
-					g.write(', ${final_ref_str}')
-					g.expr(val)
-					g.write(', sizeof(${typ_str}))')
+					if val_type.has_flag(.option) {
+						g.expr(left)
+						g.write(' = ')
+						g.expr(val)
+					} else {
+						g.write('memcpy(${final_typ_str}')
+						g.expr(left)
+						g.write(', ${final_ref_str}')
+						g.expr(val)
+						g.write(', sizeof(${typ_str}))')
+					}
 				} else if is_decl {
 					g.is_shared = var_type.has_flag(.shared_f)
 					if is_fixed_array_init && !has_val {
@@ -585,7 +599,8 @@ fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 						if val.is_auto_deref_var() {
 							g.write('*')
 						}
-						if var_type.has_flag(.option) || gen_or {
+						if (var_type.has_flag(.option) && val !in [ast.Ident, ast.SelectorExpr])
+							|| gen_or {
 							g.expr_with_opt_or_block(val, val_type, left, var_type)
 						} else if val is ast.ArrayInit {
 							g.array_init(val, c_name(ident.name))
@@ -637,7 +652,12 @@ fn (mut g Gen) gen_multi_return_assign(node &ast.AssignStmt, return_type ast.Typ
 	// multi return
 	// TODO Handle in if_expr
 	mr_var_name := 'mr_${node.pos.pos}'
-	mr_styp := g.typ(return_type.clear_flag(.option).clear_flag(.result))
+	mut is_option := return_type.has_flag(.option)
+	mut mr_styp := g.typ(return_type.clear_flag(.result))
+	if node.right[0] is ast.CallExpr && (node.right[0] as ast.CallExpr).or_block.kind != .absent {
+		is_option = false
+		mr_styp = g.typ(return_type.clear_flag(.option).clear_flag(.result))
+	}
 	g.write('${mr_styp} ${mr_var_name} = ')
 	g.expr(node.right[0])
 	g.writeln(';')
@@ -667,12 +687,16 @@ fn (mut g Gen) gen_multi_return_assign(node &ast.AssignStmt, return_type ast.Typ
 		if g.is_arraymap_set {
 			if is_auto_heap {
 				g.writeln('HEAP${noscan}(${styp}, ${mr_var_name}.arg${i}) });')
+			} else if is_option {
+				g.writeln('(*((${g.base_type(return_type)}*)${mr_var_name}.data)).arg${i} });')
 			} else {
 				g.writeln('${mr_var_name}.arg${i} });')
 			}
 		} else {
 			if is_auto_heap {
 				g.writeln(' = HEAP${noscan}(${styp}, ${mr_var_name}.arg${i});')
+			} else if is_option {
+				g.writeln(' = (*((${g.base_type(return_type)}*)${mr_var_name}.data)).arg${i};')
 			} else {
 				g.writeln(' = ${mr_var_name}.arg${i};')
 			}
